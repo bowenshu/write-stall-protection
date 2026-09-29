@@ -3417,7 +3417,7 @@ func checkRetryTestCompleted(t *testing.T, testID string) {
 }
 
 func TestWriterChunkTransferTimeoutEmulated(t *testing.T) {
-	transportClientTest(skipGRPC("service is not implemented"), t, func(t *testing.T, ctx context.Context, project, bucket string, client storageClient) {
+	transportClientTest(context.Background(), t, func(t *testing.T, ctx context.Context, project, bucket string, client storageClient) {
 		_, err := client.CreateBucket(ctx, project, bucket, &BucketAttrs{}, nil)
 		if err != nil {
 			t.Fatalf("creating bucket: %v", err)

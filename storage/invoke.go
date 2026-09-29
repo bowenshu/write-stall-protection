@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"cloud.google.com/go/internal"
 	"cloud.google.com/go/internal/version"
 	sinternal "cloud.google.com/go/storage/internal"
 	"github.com/google/uuid"
@@ -37,7 +36,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-var defaultRetry *retryConfig = &retryConfig{}
+var (
+	defaultRetry  *retryConfig = &retryConfig{}
+	errWriteStall              = errors.New("storage: write stall detected")
+)
 var xGoogDefaultHeader = fmt.Sprintf("gl-go/%s gccl/%s", version.Go(), sinternal.Version)
 
 const (
@@ -63,11 +65,120 @@ func (r *retryConfig) runShouldRetry(err error, retryCtx *RetryContext) bool {
 	return r.shouldRetry(err, retryCtx)
 }
 
+// retryBudget tracks upload session status and progress for per-chunk retry budgets
+// (Gap 1) and session recovery (Gap 2).
+type retryBudget struct {
+	mu            sync.Mutex
+	hasSession    func() bool
+	onProgress    func()
+	lastPersisted int64
+	progressMade  bool
+}
+
+// retryController is an alias for retryBudget for managing per-chunk retry budgets
+// and session recovery.
+type retryController = retryBudget
+
+// newRetryBudget creates a new retryBudget with the provided hasSession callback.
+func newRetryBudget(hasSession func() bool) *retryBudget {
+	return &retryBudget{
+		hasSession: hasSession,
+	}
+}
+
+// recordProgress signals that GCS persisted offset has updated.
+// If persistedOffset strictly advances beyond previous known offset,
+// it marks progress as made and invokes onProgress if configured.
+// It returns true if progress was made.
+func (b *retryBudget) recordProgress(persistedOffset int64) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	var onProg func()
+	progress := false
+	if persistedOffset > b.lastPersisted {
+		b.lastPersisted = persistedOffset
+		b.progressMade = true
+		onProg = b.onProgress
+		progress = true
+	}
+	b.mu.Unlock()
+	if onProg != nil {
+		onProg()
+	}
+	return progress
+}
+
+// reportProgress signals that progress has been made regardless of offset,
+// marking the retry budget for reset on the next retry evaluation.
+func (b *retryBudget) reportProgress() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.progressMade = true
+	onProg := b.onProgress
+	b.mu.Unlock()
+	if onProg != nil {
+		onProg()
+	}
+}
+
+// checkAndResetProgress returns true if progress was reported since the last check,
+// and resets the progress flag.
+func (b *retryBudget) checkAndResetProgress() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.progressMade
+	b.progressMade = false
+	return p
+}
+
+// hasActiveSession returns whether an upload session currently exists.
+func (b *retryBudget) hasActiveSession() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	fn := b.hasSession
+	b.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return false
+}
+
+// lastPersistedOffset returns the currently recorded last persisted offset.
+func (b *retryBudget) lastPersistedOffset() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastPersisted
+}
+
+// setLastPersistedOffset sets the last persisted offset.
+func (b *retryBudget) setLastPersistedOffset(offset int64) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastPersisted = offset
+}
+
 // runOptions holds optional metadata for retry contexts.
 type runOptions struct {
-	operation string
-	bucket    string
-	object    string
+	operation        string
+	bucket           string
+	object           string
+	retryBudget      *retryBudget
+	progressCallback func()
 }
 
 // runOption configures optional metadata for retry contexts.
@@ -88,6 +199,23 @@ func withObject(object string) runOption {
 	return func(o *runOptions) { o.object = object }
 }
 
+// withRetryBudget specifies a retry budget for per-chunk retry budget and session recovery.
+func withRetryBudget(b *retryBudget) runOption {
+	return func(o *runOptions) { o.retryBudget = b }
+}
+
+// withRetryController specifies a retry controller for per-chunk retry budget and session recovery.
+func withRetryController(c *retryController) runOption {
+	return func(o *runOptions) { o.retryBudget = c }
+}
+
+// withProgressCallback specifies a callback function to be called when progress is made.
+func withProgressCallback(cb func()) runOption {
+	return func(o *runOptions) {
+		o.progressCallback = cb
+	}
+}
+
 // run determines whether a retry is necessary based on the config and
 // idempotency information. It then calls the function with or without retries
 // as appropriate, using the configured settings.
@@ -98,6 +226,9 @@ func run(ctx context.Context, call func(ctx context.Context) error, retry *retry
 	options := &runOptions{}
 	for _, opt := range opts {
 		opt(options)
+	}
+	if options.progressCallback != nil && options.retryBudget != nil && options.retryBudget.onProgress == nil {
+		options.retryBudget.onProgress = options.progressCallback
 	}
 
 	attempts := 1
@@ -113,16 +244,22 @@ func run(ctx context.Context, call func(ctx context.Context) error, retry *retry
 	if retry == nil {
 		retry = defaultRetry
 	}
-	if (retry.policy == RetryIdempotent && !isIdempotent) || retry.policy == RetryNever {
+	if retry.policy == RetryNever {
 		ctxWithHeaders := setInvocationHeaders(ctx, invocationID, attempts)
 		return call(ctxWithHeaders)
 	}
-	bo := gax.Backoff{}
-	if retry.backoff != nil {
-		bo.Multiplier = retry.backoff.Multiplier
-		bo.Initial = retry.backoff.Initial
-		bo.Max = retry.backoff.Max
+	if retry.policy == RetryIdempotent && !isIdempotent && options.retryBudget == nil {
+		ctxWithHeaders := setInvocationHeaders(ctx, invocationID, attempts)
+		return call(ctxWithHeaders)
 	}
+
+	initialBo := gax.Backoff{}
+	if retry.backoff != nil {
+		initialBo.Multiplier = retry.backoff.Multiplier
+		initialBo.Initial = retry.backoff.Initial
+		initialBo.Max = retry.backoff.Max
+	}
+	bo := initialBo
 
 	var quitAfterTimer *time.Timer
 	if retry.maxRetryDuration != 0 {
@@ -131,27 +268,50 @@ func run(ctx context.Context, call func(ctx context.Context) error, retry *retry
 	}
 
 	var lastErr error
-	return internal.Retry(ctx, bo, func() (stop bool, err error) {
+	for {
 		if retry.maxRetryDuration != 0 {
 			select {
 			case <-quitAfterTimer.C:
 				if lastErr == nil {
-					return true, fmt.Errorf("storage: request not sent, choose a larger value for the retry deadline (currently set to %s)", retry.maxRetryDuration)
+					return fmt.Errorf("storage: request not sent, choose a larger value for the retry deadline (currently set to %s)", retry.maxRetryDuration)
 				}
-				return true, fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", retry.maxRetryDuration, attempts, lastErr)
+				return fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", retry.maxRetryDuration, attempts, lastErr)
 			default:
 			}
 		}
 
 		ctxWithHeaders := setInvocationHeaders(ctx, invocationID, attempts)
 		lastErr = call(ctxWithHeaders)
-		if lastErr != nil && retry.maxAttempts != nil && attempts >= *retry.maxAttempts {
-			return true, fmt.Errorf("storage: retry failed after %v attempts; last error: %w", *retry.maxAttempts, lastErr)
+		if lastErr == nil {
+			return nil
+		}
+
+		// Gap 1 (Per-Chunk Retry Budget):
+		// When progress is reported (GCS persisted offset strictly advances),
+		// reset attempts to 1 and backoff to initial so the next failure
+		// backs off from the initial duration instead of compounding across chunks.
+		if options.retryBudget != nil && options.retryBudget.checkAndResetProgress() {
+			attempts = 1
+			bo = initialBo
+		}
+
+		if retry.maxAttempts != nil && attempts >= *retry.maxAttempts {
+			return fmt.Errorf("storage: retry failed after %v attempts; last error: %w", *retry.maxAttempts, lastErr)
 		}
 
 		retryCtx.Attempt = attempts
 		retryable := retry.runShouldRetry(lastErr, retryCtx)
-		attempts++
+
+		// Gap 2 (Session Recovery):
+		// When caller did not specify preconditions (!isIdempotent) and retry policy is RetryIdempotent,
+		// retries are allowed only if an upload session exists (hasActiveSession() is true).
+		// If hasActiveSession() is false, do not retry and return lastErr immediately.
+		if !isIdempotent && retry.policy == RetryIdempotent {
+			if options.retryBudget == nil || !options.retryBudget.hasActiveSession() {
+				retryable = false
+			}
+		}
+
 		// Explicitly check context cancellation so that we can distinguish between a
 		// DEADLINE_EXCEEDED error from the server and a user-set context deadline.
 		// Unfortunately gRPC will codes.DeadlineExceeded (which may be retryable if it's
@@ -159,8 +319,37 @@ func run(ctx context.Context, call func(ctx context.Context) error, retry *retry
 		if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
 			retryable = false
 		}
-		return !retryable, lastErr
-	})
+
+		if !retryable {
+			return lastErr
+		}
+
+		attempts++
+		p := bo.Pause()
+		if ctxErr := gax.Sleep(ctx, p); ctxErr != nil {
+			if lastErr != nil {
+				return wrappedCallErr{ctxErr: ctxErr, wrappedErr: lastErr}
+			}
+			return ctxErr
+		}
+	}
+}
+
+type wrappedCallErr struct {
+	ctxErr     error
+	wrappedErr error
+}
+
+func (e wrappedCallErr) Error() string {
+	return fmt.Sprintf("retry failed with %v; last error: %v", e.ctxErr, e.wrappedErr)
+}
+
+func (e wrappedCallErr) Unwrap() error {
+	return e.wrappedErr
+}
+
+func (e wrappedCallErr) Is(err error) bool {
+	return e.ctxErr == err || e.wrappedErr == err
 }
 
 // Sets invocation ID headers on the context which will be propagated as
@@ -192,6 +381,9 @@ func setInvocationHeaders(ctx context.Context, invocationID string, attempts int
 func ShouldRetry(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errWriteStall) {
+		return true
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return true

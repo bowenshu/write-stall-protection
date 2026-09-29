@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -489,6 +490,16 @@ func TestShouldRetry(t *testing.T) {
 			inputErr:    fmt.Errorf("wrapped error: %w", &net.OpError{Op: "read", Net: "tcp", Err: errors.New("server closed idle connection")}),
 			shouldRetry: true,
 		},
+		{
+			desc:        "errWriteStall",
+			inputErr:    errWriteStall,
+			shouldRetry: true,
+		},
+		{
+			desc:        "wrapped errWriteStall",
+			inputErr:    fmt.Errorf("wrapped write stall: %w", errWriteStall),
+			shouldRetry: true,
+		},
 	} {
 		t.Run(test.desc, func(s *testing.T) {
 			got := ShouldRetry(test.inputErr)
@@ -795,4 +806,498 @@ func TestIsError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInvoke_ErrWriteStall(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	attempts := 0
+	call := func(ctx context.Context) error {
+		attempts++
+		if attempts <= 2 {
+			return fmt.Errorf("write stall error: %w", errWriteStall)
+		}
+		return nil
+	}
+
+	retry := &retryConfig{
+		backoff: &gax.Backoff{Initial: time.Millisecond},
+	}
+	err := run(ctx, call, retry, true)
+	if err != nil {
+		t.Fatalf("expected nil error after retry, got: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestInvoke_SessionRecovery(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		desc              string
+		isIdempotent      bool
+		retryPolicy       RetryPolicy
+		setupBudget       func() *retryBudget
+		callErrors        []error
+		wantAttempts      int
+		wantErr           bool
+		expectedErrTarget error
+	}{
+		{
+			desc:         "non-idempotent without retryBudget does not retry transient error",
+			isIdempotent: false,
+			setupBudget:  func() *retryBudget { return nil },
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient unavailable"),
+			},
+			wantAttempts:      1,
+			wantErr:           true,
+			expectedErrTarget: status.Error(codes.Unavailable, "transient unavailable"),
+		},
+		{
+			desc:         "non-idempotent with retryBudget but no session does not retry transient error",
+			isIdempotent: false,
+			setupBudget: func() *retryBudget {
+				return &retryBudget{
+					hasSession: func() bool { return false },
+				}
+			},
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient unavailable"),
+			},
+			wantAttempts:      1,
+			wantErr:           true,
+			expectedErrTarget: status.Error(codes.Unavailable, "transient unavailable"),
+		},
+		{
+			desc:         "non-idempotent with session retries transient error and succeeds",
+			isIdempotent: false,
+			setupBudget: func() *retryBudget {
+				return &retryBudget{
+					hasSession: func() bool { return true },
+				}
+			},
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient unavailable"),
+				nil,
+			},
+			wantAttempts: 2,
+			wantErr:      false,
+		},
+		{
+			desc:         "non-idempotent with session retries errWriteStall and succeeds",
+			isIdempotent: false,
+			setupBudget: func() *retryBudget {
+				return &retryBudget{
+					hasSession: func() bool { return true },
+				}
+			},
+			callErrors: []error{
+				errWriteStall,
+				nil,
+			},
+			wantAttempts: 2,
+			wantErr:      false,
+		},
+		{
+			desc:         "non-idempotent where session is established during first attempt retries",
+			isIdempotent: false,
+			setupBudget: func() *retryBudget {
+				sessionActive := false
+				return &retryBudget{
+					hasSession: func() bool { return sessionActive },
+					onProgress: func() { sessionActive = true },
+				}
+			},
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient unavailable"),
+				nil,
+			},
+			wantAttempts: 2,
+			wantErr:      false,
+		},
+		{
+			desc:         "non-idempotent with session does not retry non-transient error",
+			isIdempotent: false,
+			setupBudget: func() *retryBudget {
+				return &retryBudget{
+					hasSession: func() bool { return true },
+				}
+			},
+			callErrors: []error{
+				&googleapi.Error{Code: 400},
+			},
+			wantAttempts: 1,
+			wantErr:      true,
+		},
+		{
+			desc:         "non-idempotent with RetryNever does not retry even with session",
+			isIdempotent: false,
+			retryPolicy:  RetryNever,
+			setupBudget: func() *retryBudget {
+				return &retryBudget{
+					hasSession: func() bool { return true },
+				}
+			},
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient unavailable"),
+			},
+			wantAttempts: 1,
+			wantErr:      true,
+		},
+		{
+			desc:         "idempotent retries transient error even when session does not exist",
+			isIdempotent: true,
+			setupBudget: func() *retryBudget {
+				return &retryBudget{
+					hasSession: func() bool { return false },
+				}
+			},
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient unavailable"),
+				nil,
+			},
+			wantAttempts: 2,
+			wantErr:      false,
+		},
+		{
+			desc:         "non-idempotent stops retrying when session is lost",
+			isIdempotent: false,
+			setupBudget: func() *retryBudget {
+				sessionActive := true
+				b := &retryBudget{}
+				b.hasSession = func() bool { return sessionActive }
+				return b
+			},
+			callErrors: []error{
+				status.Error(codes.Unavailable, "transient 1"),
+				status.Error(codes.Unavailable, "transient 2 (session lost)"),
+			},
+			wantAttempts: 2,
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			attempts := 0
+			var budget *retryBudget
+			if tt.setupBudget != nil {
+				budget = tt.setupBudget()
+			}
+
+			call := func(ctx context.Context) error {
+				attempts++
+				if attempts == 1 && strings.Contains(tt.desc, "session is established during first attempt") {
+					budget.reportProgress()
+				}
+				if attempts == 2 && strings.Contains(tt.desc, "session is lost") {
+					budget.hasSession = func() bool { return false }
+				}
+				if attempts <= len(tt.callErrors) {
+					return tt.callErrors[attempts-1]
+				}
+				return nil
+			}
+
+			retry := &retryConfig{
+				policy:  tt.retryPolicy,
+				backoff: &gax.Backoff{Initial: time.Millisecond},
+			}
+
+			var opts []runOption
+			if budget != nil {
+				opts = append(opts, withRetryBudget(budget))
+			}
+
+			err := run(ctx, call, retry, tt.isIdempotent, opts...)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if attempts != tt.wantAttempts {
+				t.Errorf("got %d attempts, want %d", attempts, tt.wantAttempts)
+			}
+			if tt.expectedErrTarget != nil && !errors.Is(err, tt.expectedErrTarget) {
+				t.Errorf("got error %v, want target %v", err, tt.expectedErrTarget)
+			}
+		})
+	}
+}
+
+func TestInvoke_PerChunkRetryBudget_AttemptsReset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	maxAttempts := 3
+	budget := &retryBudget{
+		hasSession: func() bool { return true },
+	}
+
+	attempts := 0
+	var recordedAttemptHeaders []string
+
+	call := func(ctx context.Context) error {
+		attempts++
+		headers := callctx.HeadersFromContext(ctx)
+		if clientHeader, ok := headers["x-goog-api-client"]; ok && len(clientHeader) > 0 {
+			recordedAttemptHeaders = append(recordedAttemptHeaders, clientHeader[0])
+		}
+
+		switch attempts {
+		case 1:
+			// Chunk 1 attempt 1 fails
+			return status.Error(codes.Unavailable, "chunk 1 fail 1")
+		case 2:
+			// Chunk 1 attempt 2 fails
+			return status.Error(codes.Unavailable, "chunk 1 fail 2")
+		case 3:
+			// Chunk 1 succeeds, progress is strictly advanced!
+			budget.recordProgress(16 * 1024 * 1024)
+			// Chunk 2 then fails
+			return status.Error(codes.Unavailable, "chunk 2 fail 1")
+		case 4:
+			// Chunk 2 attempt 2 fails (no new progress)
+			return status.Error(codes.Unavailable, "chunk 2 fail 2")
+		case 5:
+			// Chunk 2 attempt 3 succeeds
+			budget.recordProgress(32 * 1024 * 1024)
+			return nil
+		default:
+			return nil
+		}
+	}
+
+	retry := &retryConfig{
+		maxAttempts: &maxAttempts,
+		backoff:     &gax.Backoff{Initial: time.Millisecond},
+	}
+
+	err := run(ctx, call, retry, true, withRetryBudget(budget))
+	if err != nil {
+		t.Fatalf("expected success with per-chunk retry budget, got: %v", err)
+	}
+
+	if attempts != 5 {
+		t.Fatalf("expected 5 total attempts across chunks, got %d", attempts)
+	}
+
+	// Verify attempt count in headers:
+	// Attempt 1: gccl-attempt-count/1
+	// Attempt 2: gccl-attempt-count/2
+	// Attempt 3: gccl-attempt-count/3
+	// Attempt 4 (Chunk 2 retry 1, after progress reset): gccl-attempt-count/2
+	// Attempt 5 (Chunk 2 retry 2): gccl-attempt-count/3
+	expectedAttemptCounts := []string{"1", "2", "3", "2", "3"}
+	if len(recordedAttemptHeaders) != len(expectedAttemptCounts) {
+		t.Fatalf("recorded %d headers, want %d", len(recordedAttemptHeaders), len(expectedAttemptCounts))
+	}
+	for i, wantCount := range expectedAttemptCounts {
+		wantSub := fmt.Sprintf("gccl-attempt-count/%s", wantCount)
+		if !strings.Contains(recordedAttemptHeaders[i], wantSub) {
+			t.Errorf("call %d: header %q does not contain %q", i+1, recordedAttemptHeaders[i], wantSub)
+		}
+	}
+}
+
+func TestInvoke_PerChunkRetryBudget_NonAdvancingProgressDoesNotReset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	maxAttempts := 3
+	budget := &retryBudget{
+		hasSession:    func() bool { return true },
+		lastPersisted: 100,
+	}
+
+	attempts := 0
+	call := func(ctx context.Context) error {
+		attempts++
+		// Re-reporting the same or lower offset does not strictly advance progress.
+		budget.recordProgress(100)
+		budget.recordProgress(50)
+		return status.Error(codes.Unavailable, "unavailable")
+	}
+
+	retry := &retryConfig{
+		maxAttempts: &maxAttempts,
+		backoff:     &gax.Backoff{Initial: time.Millisecond},
+	}
+
+	err := run(ctx, call, retry, true, withRetryBudget(budget))
+	if err == nil {
+		t.Fatalf("expected error due to maxAttempts reached, got nil")
+	}
+	if attempts != 3 {
+		t.Fatalf("expected exactly 3 attempts, got %d", attempts)
+	}
+	if !strings.Contains(err.Error(), "retry failed after 3 attempts") {
+		t.Errorf("expected maxAttempts error, got: %v", err)
+	}
+}
+
+func TestInvoke_PerChunkRetryBudget_BackoffReset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	budget := &retryBudget{
+		hasSession: func() bool { return true },
+	}
+
+	// We use initial backoff of 10ms with Multiplier=100.
+	// Failure 1: cur=10ms, next cur becomes 1000ms (1s).
+	// If progress is NOT reset, failure 2 pause would be bounded by 1000ms.
+	// When progress IS reset, cur resets to Initial (10ms), so pause remains <= 10ms!
+	attempts := 0
+
+	call := func(ctx context.Context) error {
+		attempts++
+		if attempts == 1 {
+			// First failure, no progress
+			return status.Error(codes.Unavailable, "transient 1")
+		}
+		if attempts == 2 {
+			// Progress made! Strictly advanced
+			budget.recordProgress(1024)
+			// Second failure
+			return status.Error(codes.Unavailable, "transient 2")
+		}
+		return nil
+	}
+
+	retry := &retryConfig{
+		backoff: &gax.Backoff{
+			Initial:    10 * time.Millisecond,
+			Multiplier: 100,
+			Max:        30 * time.Second,
+		},
+	}
+
+	start := time.Now()
+	err := run(ctx, call, retry, true, withRetryBudget(budget))
+	totalElapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+
+	// Because backoff was reset to 10ms for attempt 2 failure, total elapsed time
+	// should be well under 500ms (both pauses are <= 10ms each plus jitter).
+	// If it had compounded with Multiplier 100, attempt 2's pause would have had cur=1000ms (up to 1s sleep).
+	if totalElapsed > 500*time.Millisecond {
+		t.Errorf("total elapsed time %v exceeded 500ms; backoff was likely not reset to initial", totalElapsed)
+	}
+}
+
+func TestRetryBudget_Methods(t *testing.T) {
+	t.Parallel()
+
+	t.Run("recordProgress strictly advances", func(t *testing.T) {
+		b := &retryBudget{}
+
+		// 0 is not > 0
+		if b.recordProgress(0) {
+			t.Errorf("recordProgress(0) on initial 0 should return false")
+		}
+		if b.checkAndResetProgress() {
+			t.Errorf("expected no progress made")
+		}
+
+		// 100 > 0
+		if !b.recordProgress(100) {
+			t.Errorf("recordProgress(100) should return true")
+		}
+		if b.lastPersistedOffset() != 100 {
+			t.Errorf("expected lastPersistedOffset 100, got %d", b.lastPersistedOffset())
+		}
+		if !b.checkAndResetProgress() {
+			t.Errorf("expected progressMade to be true")
+		}
+		// checkAndResetProgress should have reset the flag
+		if b.checkAndResetProgress() {
+			t.Errorf("expected progressMade to be reset to false")
+		}
+
+		// Same offset 100 should not advance
+		if b.recordProgress(100) {
+			t.Errorf("recordProgress(100) again should return false")
+		}
+
+		// Lower offset 50 should not advance
+		if b.recordProgress(50) {
+			t.Errorf("recordProgress(50) should return false")
+		}
+
+		// Higher offset 200 should advance
+		if !b.recordProgress(200) {
+			t.Errorf("recordProgress(200) should return true")
+		}
+	})
+
+	t.Run("reportProgress marks progress", func(t *testing.T) {
+		b := &retryBudget{}
+		b.reportProgress()
+		if !b.checkAndResetProgress() {
+			t.Errorf("expected checkAndResetProgress to return true after reportProgress")
+		}
+	})
+
+	t.Run("onProgress callback invoked on advancement", func(t *testing.T) {
+		callbacks := 0
+		b := &retryBudget{
+			onProgress: func() { callbacks++ },
+		}
+		b.recordProgress(10) // callback 1
+		b.recordProgress(10) // no advance, no callback
+		b.recordProgress(20) // callback 2
+		b.reportProgress()   // callback 3
+
+		if callbacks != 3 {
+			t.Errorf("expected 3 callbacks, got %d", callbacks)
+		}
+	})
+
+	t.Run("hasActiveSession nil safety", func(t *testing.T) {
+		var nilBudget *retryBudget
+		if nilBudget.hasActiveSession() {
+			t.Errorf("nil budget should return false for hasActiveSession")
+		}
+
+		emptyBudget := &retryBudget{}
+		if emptyBudget.hasActiveSession() {
+			t.Errorf("empty budget should return false for hasActiveSession")
+		}
+
+		activeBudget := &retryBudget{
+			hasSession: func() bool { return true },
+		}
+		if !activeBudget.hasActiveSession() {
+			t.Errorf("active budget should return true for hasActiveSession")
+		}
+	})
+
+	t.Run("concurrent progress reporting", func(t *testing.T) {
+		b := &retryBudget{}
+		var wg sync.WaitGroup
+		for i := int64(1); i <= 100; i++ {
+			wg.Add(1)
+			go func(offset int64) {
+				defer wg.Done()
+				b.recordProgress(offset)
+			}(i)
+		}
+		wg.Wait()
+		if b.lastPersistedOffset() != 100 {
+			t.Errorf("expected lastPersistedOffset 100, got %d", b.lastPersistedOffset())
+		}
+	})
 }

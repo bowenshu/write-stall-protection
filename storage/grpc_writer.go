@@ -143,6 +143,10 @@ func (c *grpcStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 	if params.chunkRetryDeadline != 0 {
 		chunkRetryDeadline = params.chunkRetryDeadline
 	}
+	chunkTransferTimeout := params.chunkTransferTimeout
+	if params.append {
+		chunkTransferTimeout = 0
+	}
 
 	ctx := params.ctx
 	if s.userProject != "" {
@@ -202,17 +206,19 @@ func (c *grpcStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 		bufFlushedIdx:    -1, // Handle flushes to length 0
 		bufBaseOffset:    0,
 
-		chunkRetryDeadline: chunkRetryDeadline,
-		abandonRetriesTime: time.Time{},
-		attempts:           0,
-		lastErr:            nil,
-		streamSender:       nil,
+		chunkRetryDeadline:   chunkRetryDeadline,
+		chunkTransferTimeout: chunkTransferTimeout,
+		abandonRetriesTime:   time.Time{},
+		attempts:             0,
+		lastErr:              nil,
+		streamSender:         nil,
 
 		writesChan:     make(chan gRPCWriterCommand, 1),
 		currentCommand: nil,
 		streamResult:   nil,
 		donec:          params.donec,
 	}
+	w.retryBudget = newRetryBudget(w.hasSession)
 
 	go func() {
 		if err := w.gatherFirstBuffer(); err != nil {
@@ -231,14 +237,26 @@ func (c *grpcStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 		// consistency with HTTP client behavior. Writers should use
 		// ChunkRetryDeadline for per-chunk timeouts and context for overall timeouts.
 		writerRetry := w.settings.retry
-		if writerRetry != nil {
+		if writerRetry == nil {
+			writerRetry = defaultRetry.clone()
+		} else {
 			writerRetry = writerRetry.clone()
-			writerRetry.maxRetryDuration = 0
+		}
+		writerRetry.maxRetryDuration = 0
+		origShouldRetry := writerRetry.shouldRetry
+		writerRetry.shouldRetry = func(err error, retryCtx *RetryContext) bool {
+			if errors.Is(err, errWriteStall) {
+				return true
+			}
+			if origShouldRetry != nil {
+				return origShouldRetry(err, retryCtx)
+			}
+			return ShouldRetry(err)
 		}
 		w.streamResult = checkCanceled(run(w.preRunCtx, func(ctx context.Context) error {
 			w.lastErr = w.writeLoop(ctx)
 			return w.lastErr
-		}, writerRetry, w.settings.idempotent, withOperation("WriteObject"), withBucket(w.bucket), withObject(w.attrs.Name)))
+		}, writerRetry, w.settings.idempotent, withRetryBudget(w.retryBudget), withOperation("WriteObject"), withBucket(w.bucket), withObject(w.attrs.Name)))
 		w.setError(w.streamResult)
 		close(w.donec)
 	}()
@@ -289,11 +307,15 @@ type gRPCWriter struct {
 	bufFlushedIdx    int
 	bufBaseOffset    int64
 
-	chunkRetryDeadline time.Duration
-	abandonRetriesTime time.Time
-	attempts           int
-	lastErr            error
-	streamSender       gRPCBidiWriteBufferSender
+	chunkRetryDeadline   time.Duration
+	chunkTransferTimeout time.Duration
+	retryBudget          *retryBudget
+	lastPersistedOffset  int64
+	abandonRetriesTime   time.Time
+	attempts             int
+	lastErr              error
+	streamSender         gRPCBidiWriteBufferSender
+	watchdog             *writeStallWatchdog
 
 	// Communication from the user goroutine to the stream management goroutines
 	writesChan         chan gRPCWriterCommand
@@ -373,6 +395,13 @@ func (w *gRPCWriter) handleCompletion(c gRPCBidiWriteCompletion) {
 		w.setObj(newObjectFromProto(c.resource))
 	}
 
+	if c.flushOffset > w.lastPersistedOffset {
+		w.lastPersistedOffset = c.flushOffset
+		if w.retryBudget != nil {
+			w.retryBudget.recordProgress(c.flushOffset)
+		}
+	}
+
 	// Already handled this completion
 	if c.flushOffset <= w.bufBaseOffset+int64(w.bufFlushedIdx) {
 		return
@@ -397,6 +426,14 @@ func (w *gRPCWriter) handleCompletion(c gRPCBidiWriteCompletion) {
 	// Restart the stopwatch if there is still more data waiting to be sent.
 	if w.chunkRetryDeadline > 0 && w.isActive() {
 		w.abandonRetriesTime = time.Now().Add(w.chunkRetryDeadline)
+	}
+
+	if w.watchdog != nil {
+		if w.isActive() {
+			w.watchdog.reset()
+		} else {
+			w.watchdog.pause()
+		}
 	}
 }
 
@@ -449,7 +486,7 @@ func (w *gRPCWriter) gatherFirstBuffer() error {
 	return errors.New("storage.Writer: unexpectedly closed w.writesChan")
 }
 
-func (w *gRPCWriter) writeLoop(ctx context.Context) error {
+func (w *gRPCWriter) writeLoop(ctx context.Context) (retErr error) {
 	w.attempts++
 	if w.chunkRetryDeadline > 0 {
 		if w.isActive() {
@@ -472,9 +509,32 @@ func (w *gRPCWriter) writeLoop(ctx context.Context) error {
 	requestAcks := make(chan struct{}, 1)
 	chcs := gRPCWriterCommandHandleChans{requests, requestAcks, completions}
 	bscs := gRPCBufSenderChans{requests, requestAcks, completions}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	w.streamSender.connect(ctx, bscs, w.settings.gax...)
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	defer attemptCancel()
+
+	if w.chunkTransferTimeout > 0 {
+		watchdog := newWriteStallWatchdog(w.chunkTransferTimeout, func() {
+			target := stripPort(metricsStateFromContext(w.preRunCtx).getTarget())
+			if w.c != nil && w.c.metrics != nil {
+				w.c.metrics.recordStallDuration(attemptCtx, w.chunkTransferTimeout, "BidiWriteObject", "grpc", target)
+			}
+			attemptCancel()
+		})
+		w.watchdog = watchdog
+		defer func() {
+			watchdog.stop()
+			if watchdog.isStalled() {
+				retErr = fmt.Errorf("%w: chunk transfer timed out after %v", errWriteStall, w.chunkTransferTimeout)
+			}
+			w.watchdog = nil
+		}()
+		// Stage 1 Scope:
+		// StartResumableWrite, QueryWriteStatus, and initial BidiWriteObject stream connection share the ChunkTransferTimeout duration.
+		// Under writeLoop, if chunkTransferTimeout > 0, the timer is armed for Stage 1.
+		watchdog.start()
+	}
+
+	w.streamSender.connect(attemptCtx, bscs, w.settings.gax...)
 
 	// Drain any initial completions (like QueryWriteStatus results).
 Loop:
@@ -526,6 +586,9 @@ Loop:
 				if w.chunkRetryDeadline > 0 && !w.isActive() {
 					w.abandonRetriesTime = time.Time{}
 				}
+				if w.watchdog != nil && !w.isActive() {
+					w.watchdog.pause()
+				}
 			}
 			select {
 			case c, ok := <-completions:
@@ -539,6 +602,9 @@ Loop:
 					return errors.New("storage.Writer: unexpectedly closed w.writesChan")
 				}
 				w.currentCommand = cmd
+				if w.watchdog != nil {
+					w.watchdog.resume()
+				}
 			}
 		}
 	}()
@@ -568,7 +634,7 @@ Loop:
 		}
 	} else {
 		// Unclean shutdown. Cancel the context so we clean up expeditiously.
-		cancel()
+		attemptCancel()
 	}
 
 	close(requests)
@@ -579,6 +645,135 @@ Loop:
 		return w.streamSender.err()
 	}
 	return closeErr.err
+}
+
+func (w *gRPCWriter) hasSession() bool {
+	if w.append {
+		return false
+	}
+	if s, ok := w.streamSender.(*gRPCResumableBidiWriteBufferSender); ok {
+		return s.upid != ""
+	}
+	if s, ok := w.streamSender.(interface{ hasSession() bool }); ok {
+		return s.hasSession()
+	}
+	return false
+}
+
+type writeStallWatchdog struct {
+	mu            sync.Mutex
+	timeout       time.Duration
+	timer         *time.Timer
+	running       bool
+	stallOccurred bool
+	onStall       func()
+}
+
+func newWriteStallWatchdog(timeout time.Duration, onStall func()) *writeStallWatchdog {
+	return &writeStallWatchdog{
+		timeout: timeout,
+		onStall: onStall,
+	}
+}
+
+func (w *writeStallWatchdog) start() {
+	if w == nil || w.timeout <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stallOccurred {
+		return
+	}
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.running = true
+	w.timer = time.AfterFunc(w.timeout, w.fire)
+}
+
+func (w *writeStallWatchdog) reset() {
+	if w == nil || w.timeout <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stallOccurred {
+		return
+	}
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.running = true
+	w.timer = time.AfterFunc(w.timeout, w.fire)
+}
+
+func (w *writeStallWatchdog) pause() {
+	if w == nil || w.timeout <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stallOccurred || !w.running {
+		return
+	}
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.running = false
+}
+
+func (w *writeStallWatchdog) resume() {
+	if w == nil || w.timeout <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stallOccurred || w.running {
+		return
+	}
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.running = true
+	w.timer = time.AfterFunc(w.timeout, w.fire)
+}
+
+func (w *writeStallWatchdog) stop() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.running = false
+}
+
+func (w *writeStallWatchdog) isStalled() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.stallOccurred
+}
+
+func (w *writeStallWatchdog) fire() {
+	w.mu.Lock()
+	if !w.running || w.stallOccurred {
+		w.mu.Unlock()
+		return
+	}
+	w.stallOccurred = true
+	w.running = false
+	onStall := w.onStall
+	w.mu.Unlock()
+
+	if onStall != nil {
+		onStall()
+	}
 }
 
 // gRPCWriterCommandHandleChans contains the channels that a gRPCWriterCommand
@@ -1083,6 +1278,10 @@ func (w *gRPCWriter) newGRPCOneshotBidiWriteBufferSender() *gRPCOneshotBidiWrite
 
 func (s *gRPCOneshotBidiWriteBufferSender) err() error { return s.streamErr }
 
+func (s *gRPCOneshotBidiWriteBufferSender) hasSession() bool {
+	return false
+}
+
 func (s *gRPCOneshotBidiWriteBufferSender) connect(ctx context.Context, cs gRPCBufSenderChans, opts ...gax.CallOption) {
 	s.streamErr = nil
 	ctx = gRPCWriteRequestParams{bucket: s.bucket}.apply(ctx)
@@ -1221,6 +1420,13 @@ func (w *gRPCWriter) newGRPCResumableBidiWriteBufferSender() *gRPCResumableBidiW
 
 func (s *gRPCResumableBidiWriteBufferSender) err() error { return s.streamErr }
 
+func (s *gRPCResumableBidiWriteBufferSender) hasSession() bool {
+	if s == nil {
+		return false
+	}
+	return s.upid != ""
+}
+
 func (s *gRPCResumableBidiWriteBufferSender) connect(ctx context.Context, cs gRPCBufSenderChans, opts ...gax.CallOption) {
 	s.streamErr = nil
 	ctx = gRPCWriteRequestParams{bucket: s.bucket}.apply(ctx)
@@ -1352,6 +1558,16 @@ type gRPCAppendBidiWriteBufferSender struct {
 }
 
 func (s *gRPCAppendBidiWriteBufferSender) err() error { return s.streamErr }
+
+func (s *gRPCAppendBidiWriteBufferSender) hasSession() bool {
+	if s == nil {
+		return false
+	}
+	if s.takeoverWriter {
+		return true
+	}
+	return s.firstMessage != nil && s.firstMessage.GetAppendObjectSpec() != nil
+}
 
 // Use for a newly created appendable object.
 func (w *gRPCWriter) newGRPCAppendableObjectBufferSender() *gRPCAppendBidiWriteBufferSender {

@@ -144,7 +144,7 @@ type Writer struct {
 	// a retry if the request to upload a particular chunk stalls for longer than
 	// this duration. Retries may continue until the ChunkRetryDeadline is reached.
 	//
-	// ChunkTransferTimeout is not applicable to uploads made using a gRPC client.
+	// Supported for both HTTP and gRPC resumable uploads.
 	//
 	// The default value is no timeout.
 	ChunkTransferTimeout time.Duration
